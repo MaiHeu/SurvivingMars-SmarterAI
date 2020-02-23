@@ -1,0 +1,234 @@
+-- WORKPLACE
+function Workplace:GetFreeSlots()
+  if self.active_shift > 0 then
+    local shift = self.active_shift
+    return self.max_workers - self:GetWorkersCount(shift) - (self.closed_workplaces[shift] or 0)
+  end
+  local sum = 0
+  local max = self.max_workers
+  for i = 1, self.max_shifts do
+    sum = sum + Max(0, max - self:GetWorkersCount(i) - (self.closed_workplaces[i] or 0))
+  end
+  return sum
+end
+
+function GetWorkersCount(bld, shift, unit, is_training)
+  if not bld then
+    return 0, 0, 0
+  end
+  local none, workers, max_workers = 0, 0, 0
+  if is_training then
+    none = 0
+    workers = bld:GetVisitorsCount(shift)
+    max_workers = bld.max_visitors - (bld.closed_visitor_slots[shift] or 0)
+  else
+    none = bld:CountWorkersToKick(unit, shift)
+    workers = bld:GetWorkersCount(shift)
+    max_workers = bld.max_workers - (bld.closed_workplaces[shift] or 0)
+  end
+  return none, workers, max_workers
+end
+
+function Workplace:GetWorkersCount(shift)
+  return self.workers and #self.workers[shift] or 0
+end
+
+function Workplace:CountWorkersToKick(unit, shift)
+  local count = 0
+  for s = shift or 1, shift or #self.workers do
+    for _, worker in ipairs(self.workers[s]) do
+      if self:IsPreferredWorker(unit, worker) then
+        count = count + 1
+      end
+    end
+  end
+  return count
+end
+
+function Workplace:GetWorkerToKick(unit, shift)
+  for s = shift or 1, shift or #self.workers do
+    for _, worker in ipairs(self.workers[s]) do
+      if self:IsPreferredWorker(unit, worker) then
+        return worker
+      end
+    end
+  end
+end
+
+function Workplace:IsPreferredWorker(unit, worker, ignore_forced, check_performance)
+  if not ignore_forced and worker:CheckForcedWorkplace() then
+    return false
+  end
+  if not unit then
+    return true
+  end
+  local specialization = self.specialist
+  local worker_specialist = worker.specialist or false
+  local unit_specialist = unit.specialist or false
+  if worker_specialist ~= specialization and unit_specialist == specialization then
+    return true
+  end
+  if worker_specialist == specialization and unit_specialist ~= specialization then
+    return false
+  end
+  local worker_renegade = worker.traits.Renegade or false
+  local unit_renegade = unit.traits.Renegade or false
+  if unit_renegade and not worker_renegade then
+    return false
+  end
+  if worker_renegade and not unit_renegade then
+    return true
+  end
+  if not check_performance then
+    return false
+  end
+  return worker.performance < unit.performance
+end
+
+local FilterWorkplaces = function(unit, only_specs)
+  local dome_workplaces
+  local cur_workplace = unit.workplace
+  if cur_workplace and unit.lock_workplace then
+    if IsKindOf(cur_workplace, "Workplace") then
+      dome_workplaces = {cur_workplace}
+    end
+  elseif unit:CanWork() then
+    local dome = unit.dome
+    local dome_dist = dome:GetOutsideWorkplacesDist()
+    local avoid_workplace = unit.avoid_workplace
+    if avoid_workplace and (not unit.avoid_workplace_start or unit.avoid_workplace_start + g_Consts.AvoidWorkplaceSols < unit.city.day) then
+      avoid_workplace = false
+    end
+    local specialist = unit.specialist
+    for _, workplace in ipairs(unit.city.labels.Workplace or empty_table) do
+      local parent_dome = workplace.parent_dome
+      
+      if workplace.allow_all_workers == nil then workplace.allow_all_workers = true end
+      
+      if (workplace.specialist == specialist or not only_specs) 
+      and (workplace.specialist == specialist or workplace.allow_all_workers) 
+      and not workplace.destroyed 
+      and not workplace.demolishing 
+      and (parent_dome == dome or not parent_dome and dome_dist >= HexAxialDistance(workplace, dome)) 
+      and workplace.ui_working 
+      and workplace.max_workers > 0
+      and workplace ~= avoid_workplace 
+      and (workplace:GetFreeSlots() > 0 or workplace.specialist == specialist and workplace:GetWorkerToKick(unit, false)) 
+      then
+        dome_workplaces = dome_workplaces or {}
+        dome_workplaces[#dome_workplaces + 1] = workplace
+      end
+    end
+  end
+  return dome_workplaces
+end
+
+local GetShifts = function(bld, is_training)
+  if is_training then
+    return #bld.visitors
+  end
+  return #bld.workers
+end
+
+function SmartChooseWorkplace(unit, work_type)
+  -- Firstly look for specialised work
+  local dome_workplaces = FilterWorkplaces(unit, true)
+  -- Now try to find workplaces without specialisation
+  if not dome_workplaces then
+    dome_workplaces = FilterWorkplaces(unit, false)
+  end
+  -- Bad luck bugger
+  if not dome_workplaces then
+    return unit.workplace, unit.workplace_shift, false
+  end
+  
+  local current_bld = unit.workplace
+  local current_shift = unit.workplace_shift
+  local current_priority = current_bld and current_bld.priority or 0
+  local unit_specialization = unit.specialist
+  local none, current_workers, max_workers = GetWorkersCount(current_bld, current_shift, unit, current_bld and current_bld:IsKindOf("TrainingBuilding"))
+  current_workers = current_workers - none
+  local current_workplace_percent = current_bld and max_workers > 0 and MulDivRound(current_workers, 100, max_workers) or 0
+  local current_workplace_percent_after = current_bld and max_workers > 0 and MulDivRound(current_workers - 1, 100, max_workers) or 0
+  local training_now = current_bld and not current_bld.is_workplace
+  local best_bld, best_shift, best_priority, best_kicked_none
+  for i = const.MaxBuildingPriority, 0, -1 do
+    if i < current_priority then
+      return current_bld, current_shift, false
+    end
+    if not current_bld or i > current_priority then
+      local score
+      for _, workplace in ipairs(dome_workplaces) do
+        if workplace.priority == i then
+          local nShifts = GetShifts(workplace)
+          for k = 1, nShifts do
+            local kicked_none
+            local none, count_workers, max_workers = GetWorkersCount(workplace, k, unit)
+            local current_workers = count_workers - none
+            if max_workers > 0 then
+              local new_workforce_after = MulDivRound(current_workers + 1, 100, max_workers)
+              if (not score or score > new_workforce_after or best_bld.specialist ~= unit_specialization and workplace.specialist == unit_specialization) then
+                local free_workplace = count_workers < max_workers
+                kicked_none = none > 0 and workplace:GetWorkerToKick(unit, k)
+				if free_workplace then
+                  score = new_workforce_after
+                  best_bld = workplace
+                  best_shift = k
+                  best_priority = i
+                  best_kicked_none = false
+				elseif none > 0 and workplace:GetWorkerToKick(unit, k) then
+				  score = new_workforce_after
+                  best_bld = workplace
+                  best_shift = k
+                  best_priority = i
+                  best_kicked_none = kicked_none
+                end
+              end
+            end
+          end
+        end
+      end
+      if score then
+        return best_bld, best_shift, best_kicked_none or false
+      end
+    end
+    if current_priority == i then
+      local score
+      for _, workplace in ipairs(dome_workplaces) do
+        if workplace.priority == i then
+          local nShifts = GetShifts(workplace)
+          for k = 1, nShifts do
+            local kicked_none
+            local none, count_workers, max_workers = GetWorkersCount(workplace, k, unit)
+            local current_workers = count_workers - none
+            if max_workers > 0 and (unit.workplace_shift ~= k or workplace ~= current_bld) then
+              local new_workforce_before = MulDivRound(current_workers, 100, max_workers)
+              local new_workforce_after = MulDivRound(current_workers + 1, 100, max_workers)
+              local free_workplace = count_workers < max_workers
+              kicked_none = none > 0 and workplace:GetWorkerToKick(unit, k)
+              if kicked_none and (best_bld and best_bld.specialist ~= unit_specialization or current_bld and current_bld.specialist ~= unit_specialization) then
+                score = new_workforce_after
+                best_bld = workplace
+                best_shift = k
+                best_priority = i
+                best_kicked_none = kicked_none
+              elseif free_workplace and current_workplace_percent_after > new_workforce_before and (not score or new_workforce_after > score or best_bld.specialist ~= unit_specialization and workplace.specialist == unit_specialization) then
+                score = new_workforce_after
+                best_bld = workplace
+                best_shift = k
+                best_priority = i
+                best_kicked_none = false
+              end
+            end
+          end
+        end
+      end
+      return best_bld or current_bld, best_shift or current_shift, best_kicked_none
+    end
+  end
+  return best_bld, best_shift
+end
+
+VanillaChooseWorkplace = ChooseWorkplace
+ChooseWorkplace = SmartChooseWorkplace
+-- END OF WORKPLACE
